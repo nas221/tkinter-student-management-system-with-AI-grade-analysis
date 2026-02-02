@@ -1,0 +1,1516 @@
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog, simpledialog
+import sqlite3
+import time
+import random
+import requests
+import csv
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+from bs4 import BeautifulSoup
+import pandas as pd
+import json # Added for debug logging
+import sys # Added for debug logging
+import os # Added for debug logging
+
+def _log_debug_info(location, message, data, level="A"):
+    if os.environ.get("STUDYCOMP_DEBUG") != "1":
+        return
+    payload = {
+        "level": level,
+        "location": location,
+        "message": message,
+        "data": data,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+    print(json.dumps(payload, ensure_ascii=True))
+
+try:
+    from sklearn.linear_model import LinearRegression
+except Exception:
+    class LinearRegression:
+        def __init__(self):
+            self.coef_ = np.array([0.0])
+
+        def fit(self, X, y):
+            if X.size == 0:
+                self.coef_ = np.array([0.0])
+                return self
+            slope = np.polyfit(X.reshape(-1), y, 1)[0]
+            self.coef_ = np.array([slope])
+            return self
+
+def create_db():
+    conn = sqlite3.connect("todo.db")
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                study_goals TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_name TEXT NOT NULL,
+                due_date TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS study_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subject TEXT,
+                duration INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                test_name TEXT NOT NULL,
+                grade REAL NOT NULL,
+                date TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flashcards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                subject TEXT,
+                difficulty INTEGER,
+                last_reviewed TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+# --- Timer Class with Study Tracking ---
+class Timer:
+    def __init__(self, master, user_id):
+        self.master = master
+        self.user_id = user_id
+        self.time_left = 0
+        self.timer_running = False
+        self.start_time = None
+        self.current_subject = "General"
+
+        # Timer UI
+        self.timer_label = tk.Label(master, text="25:00", font=("Helvetica", 30))
+        self.timer_label.pack(pady=20)
+
+        # Subject Selection
+        self.subject_frame = tk.Frame(master)
+        self.subject_frame.pack(pady=10)
+        tk.Label(self.subject_frame, text="Study Subject:").pack(side=tk.LEFT)
+        self.subject_entry = ttk.Combobox(self.subject_frame, values=["Math", "Science", "History", "Language", "Other"])
+        self.subject_entry.pack(side=tk.LEFT, padx=5)
+        self.subject_entry.set("General")
+        self.subject_entry.bind("<<ComboboxSelected>>", self.update_subject)
+
+        # Control Buttons
+        btn_frame = tk.Frame(master)
+        btn_frame.pack(pady=10)
+        
+        self.start_button = tk.Button(btn_frame, text="Start", command=self.start_timer, bg="#4CAF50", fg="white")
+        self.start_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = tk.Button(btn_frame, text="Stop", command=self.stop_timer, bg="#F44336", fg="white")
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
+        self.reset_button = tk.Button(btn_frame, text="Reset", command=self.reset_timer, bg="#2196F3", fg="white")
+        self.reset_button.pack(side=tk.LEFT, padx=5)
+
+    def update_subject(self, event):
+        self.current_subject = self.subject_entry.get()
+
+    def start_timer(self):
+        if not self.timer_running:
+            self.timer_running = True
+            self.time_left = 25 * 60  # 25 minutes
+            self.start_time = datetime.now()
+            self.countdown()
+
+    def stop_timer(self):
+        if self.timer_running:
+            self.timer_running = False
+            self.record_study_session()
+
+    def reset_timer(self):
+        self.timer_running = False
+        self.time_left = 25 * 60
+        self.update_timer()
+
+    def countdown(self):
+        if self.timer_running:
+            if self.time_left > 0:
+                self.time_left -= 1
+                self.update_timer()
+                self.master.after(1000, self.countdown)
+            else:
+                self.timer_running = False
+                self.record_study_session()
+                messagebox.showinfo("Time's Up", "Great work! Take a 5-minute break.")
+                self.reset_timer()
+
+    def update_timer(self):
+        minutes, seconds = divmod(self.time_left, 60)
+        self.timer_label.config(text=f"{minutes:02d}:{seconds:02d}")
+
+    def record_study_session(self):
+        if self.start_time:
+            duration = (datetime.now() - self.start_time).seconds // 60  # in minutes
+            try:
+                conn = sqlite3.connect("todo.db")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO study_sessions (user_id, subject, duration, date) VALUES (?, ?, ?, ?)",
+                    (self.user_id, self.current_subject, duration, datetime.now().strftime("%Y-%m-%d"))
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"Error recording study session: {e}")
+            finally:
+                if conn:
+                    conn.close()
+
+# --- Enhanced ToDo List with User-Specific Tasks ---
+class ToDoList:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.window = tk.Toplevel()
+        self.window.title("To-Do List")
+        self.window.geometry("600x500")
+
+        # Priority Options
+        self.priority_options = ["High", "Medium", "Low"]
+
+        # Task List
+        self.task_listbox = tk.Listbox(self.window, height=15, width=80, font=("Helvetica", 10))
+        self.task_listbox.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+        
+        # Scrollbar
+        scrollbar = tk.Scrollbar(self.task_listbox)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.task_listbox.config(yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.task_listbox.yview)
+
+        # Input Frame
+        input_frame = tk.Frame(self.window)
+        input_frame.pack(pady=10, fill=tk.X)
+
+        tk.Label(input_frame, text="Task:").grid(row=0, column=0, padx=5)
+        self.task_entry = tk.Entry(input_frame, width=30)
+        self.task_entry.grid(row=0, column=1, padx=5)
+
+        tk.Label(input_frame, text="Due Date:").grid(row=0, column=2, padx=5)
+        self.due_date_entry = tk.Entry(input_frame, width=15)
+        self.due_date_entry.grid(row=0, column=3, padx=5)
+        self.due_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+        tk.Label(input_frame, text="Priority:").grid(row=0, column=4, padx=5)
+        self.priority_var = tk.StringVar(value="Medium")
+        self.priority_menu = ttk.Combobox(input_frame, textvariable=self.priority_var, 
+                                        values=self.priority_options, width=8)
+        self.priority_menu.grid(row=0, column=5, padx=5)
+
+        # Button Frame
+        btn_frame = tk.Frame(self.window)
+        btn_frame.pack(pady=10)
+
+        self.add_button = tk.Button(btn_frame, text="Add Task", command=self.add_task, bg="#4CAF50", fg="white")
+        self.add_button.pack(side=tk.LEFT, padx=5)
+
+        self.remove_button = tk.Button(btn_frame, text="Remove Task", command=self.remove_task, bg="#F44336", fg="white")
+        self.remove_button.pack(side=tk.LEFT, padx=5)
+
+        self.complete_button = tk.Button(btn_frame, text="Mark Complete", command=self.mark_complete, bg="#2196F3", fg="white")
+        self.complete_button.pack(side=tk.LEFT, padx=5)
+
+        # Load tasks
+        self.load_tasks()
+
+    def load_tasks(self):
+        self.task_listbox.delete(0, tk.END)
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, task_name, due_date FROM tasks WHERE user_id = ? ORDER BY due_date", (self.user_id,))
+            tasks = cursor.fetchall()
+            
+            for task in tasks:
+                task_text = f"{task[1]} (Due: {task[2]})"
+                self.task_listbox.insert(tk.END, task_text)
+                self.task_listbox.itemconfig(tk.END, {'fg': self.get_priority_color(task[2])})
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load tasks: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_priority_color(self, due_date):
+        due = datetime.strptime(due_date, "%Y-%m-%d").date()
+        today = datetime.now().date()
+        delta = (due - today).days
+        
+        if delta < 0:
+            return "red"  # Overdue
+        elif delta == 0:
+            return "orange"  # Due today
+        elif delta <= 2:
+            return "dark orange"  # Due in 1-2 days
+        else:
+            return "black"  # Not urgent
+
+    def add_task(self):
+        task_name = self.task_entry.get()
+        due_date = self.due_date_entry.get()
+        priority = self.priority_var.get()
+
+        if not task_name or not due_date:
+            messagebox.showwarning("Input Error", "Please enter both task name and due date")
+            return
+
+        try:
+            datetime.strptime(due_date, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Please enter date in YYYY-MM-DD format")
+            return
+
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO tasks (task_name, due_date, user_id) VALUES (?, ?, ?)",
+                (task_name, due_date, self.user_id)
+            )
+            conn.commit()
+            self.task_entry.delete(0, tk.END)
+            self.load_tasks()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add task: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def remove_task(self):
+        selection = self.task_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a task to remove")
+            return
+            
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM tasks WHERE user_id = ?", (self.user_id,))
+            task_ids = [row[0] for row in cursor.fetchall()]
+            
+            if selection[0] < len(task_ids):
+                task_id = task_ids[selection[0]]
+                cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                conn.commit()
+                self.load_tasks()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to remove task: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def mark_complete(self):
+        self.remove_task()  # For now, just remove completed tasks
+        messagebox.showinfo("Task Complete", "Great job completing your task!")
+
+# --- AI-Powered Grade Tracker ---
+class GradeTracker:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.window = tk.Toplevel()
+        self.window.title("Grade Tracker with AI Analysis")
+        self.window.geometry("900x700")
+
+        # Notebook for tabs
+        self.notebook = ttk.Notebook(self.window)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Grade Entry Tab
+        self.entry_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.entry_tab, text="Add Grades")
+
+        # Analysis Tab
+        self.analysis_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.analysis_tab, text="AI Analysis")
+
+        # Setup tabs
+        self.setup_entry_tab()
+        self.setup_analysis_tab()
+
+        # Load initial data
+        self.display_grades()
+
+    def setup_entry_tab(self):
+        # Input Frame
+        input_frame = ttk.LabelFrame(self.entry_tab, text="Add New Grade", padding=10)
+        input_frame.pack(pady=10, padx=10, fill=tk.X)
+
+        ttk.Label(input_frame, text="Subject:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.subject_entry = ttk.Entry(input_frame, width=25)
+        self.subject_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="Test Name:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.test_name_entry = ttk.Entry(input_frame, width=25)
+        self.test_name_entry.grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="Grade (0-100):").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        self.grade_entry = ttk.Entry(input_frame, width=10)
+        self.grade_entry.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+
+        ttk.Label(input_frame, text="Date (YYYY-MM-DD):").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
+        self.date_entry = ttk.Entry(input_frame, width=15)
+        self.date_entry.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+        add_btn = ttk.Button(input_frame, text="Add Grade", command=self.add_grade)
+        add_btn.grid(row=4, columnspan=2, pady=10)
+
+        # Graph Frame
+        self.graph_frame = ttk.Frame(self.entry_tab)
+        self.graph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def setup_analysis_tab(self):
+        # Analysis Frame
+        analysis_frame = ttk.Frame(self.analysis_tab)
+        analysis_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Weak Topics Analysis
+        ttk.Label(analysis_frame, text="AI Weak Topic Analysis", font=("Helvetica", 12, "bold")).pack(pady=10)
+        
+        self.analyze_btn = ttk.Button(
+            analysis_frame, 
+            text="Run AI Analysis", 
+            command=self.analyze_weak_topics,
+            style="Accent.TButton"
+        )
+        self.analyze_btn.pack(pady=10)
+
+        self.recommendation_text = tk.Text(
+            analysis_frame, 
+            height=12, 
+            width=80,
+            wrap=tk.WORD,
+            font=("Helvetica", 10)
+        )
+        self.recommendation_text.pack(pady=10, fill=tk.BOTH, expand=True)
+        self.recommendation_text.insert(tk.END, "Click 'Run AI Analysis' to get personalized recommendations...")
+        self.recommendation_text.config(state=tk.DISABLED)
+
+        # Study Plan Frame
+        ttk.Label(analysis_frame, text="Suggested Study Plan", font=("Helvetica", 12, "bold")).pack(pady=10)
+        
+        self.study_plan_text = tk.Text(
+            analysis_frame, 
+            height=8, 
+            width=80,
+            wrap=tk.WORD,
+            font=("Helvetica", 10)
+        )
+        self.study_plan_text.pack(pady=10, fill=tk.BOTH, expand=True)
+        self.study_plan_text.insert(tk.END, "Your customized study plan will appear here...")
+        self.study_plan_text.config(state=tk.DISABLED)
+
+    def add_grade(self):
+        subject = self.subject_entry.get()
+        test_name = self.test_name_entry.get()
+        grade = self.grade_entry.get()
+        date_str = self.date_entry.get()
+
+        if not all([subject, test_name, grade, date_str]):
+            messagebox.showerror("Error", "All fields are required!")
+            return
+
+        try:
+            grade = float(grade)
+            if grade < 0 or grade > 100:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Grade must be a number between 0 and 100")
+            return
+
+        try:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+            current_date = datetime.now().date()
+            if date_obj > current_date:
+                messagebox.showerror("Error", "Date cannot be in the future!")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Invalid date format! Use YYYY-MM-DD")
+            return
+
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO grades (user_id, subject, test_name, grade, date) VALUES (?, ?, ?, ?, ?)",
+                (self.user_id, subject, test_name, grade, date_str)
+            )
+            conn.commit()
+            messagebox.showinfo("Success", "Grade added successfully!")
+            self.subject_entry.delete(0, tk.END)
+            self.test_name_entry.delete(0, tk.END)
+            self.grade_entry.delete(0, tk.END)
+            self.display_grades()
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Failed to add grade: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_grades(self):
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT subject, test_name, grade, date FROM grades WHERE user_id = ? ORDER BY date",
+                (self.user_id,)
+            )
+            grades = cursor.fetchall()
+            return grades
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Failed to fetch grades: {str(e)}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def display_grades(self):
+        grades = self.get_grades()
+        
+        # Clear previous graph
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+
+        if not grades:
+            ttk.Label(self.graph_frame, text="No grade data available").pack()
+            return
+
+        # Organize data by subject
+        subjects = {}
+        for subject, test_name, grade, date in grades:
+            if subject not in subjects:
+                subjects[subject] = {'dates': [], 'grades': [], 'tests': []}
+            subjects[subject]['dates'].append(date)
+            subjects[subject]['grades'].append(grade)
+            subjects[subject]['tests'].append(test_name)
+
+        # Create figure with multiple subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        fig.subplots_adjust(hspace=0.5)
+
+        # Plot 1: Grade Trends
+        colors = plt.cm.tab10.colors
+        for i, (subject, data) in enumerate(subjects.items()):
+            ax1.plot(data['dates'], data['grades'], 'o-', 
+                    color=colors[i % len(colors)], 
+                    label=subject)
+            
+            # Annotate each point with test name
+            for date, grade, test in zip(data['dates'], data['grades'], data['tests']):
+                ax1.annotate(test, (date, grade), 
+                            textcoords="offset points", 
+                            xytext=(0,5), 
+                            ha='center',
+                            fontsize=8)
+
+        ax1.set_title('Grade Trends Over Time')
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Grade (%)')
+        ax1.set_ylim(0, 100)
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax1.grid(True, linestyle='--', alpha=0.7)
+        plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
+
+        # Plot 2: Subject Averages
+        subject_avgs = [(subj, np.mean(data['grades'])) for subj, data in subjects.items()]
+        subjects_sorted, avgs_sorted = zip(*sorted(subject_avgs, key=lambda x: x[1]))
+        
+        colors = ['red' if avg < 70 else 'green' if avg > 85 else 'orange' for avg in avgs_sorted]
+        ax2.barh(subjects_sorted, avgs_sorted, color=colors)
+        ax2.set_title('Subject Averages')
+        ax2.set_xlabel('Average Grade (%)')
+        ax2.set_xlim(0, 100)
+        ax2.grid(True, linestyle='--', alpha=0.7)
+
+        # Add value labels
+        for i, v in enumerate(avgs_sorted):
+            ax2.text(v + 1, i, f"{v:.1f}%", color='black', va='center')
+
+        # Embed the graph in Tkinter
+        canvas = FigureCanvasTkAgg(fig, master=self.graph_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def analyze_weak_topics(self):
+        grades = self.get_grades()
+        if not grades:
+            messagebox.showwarning("No Data", "No grade data available for analysis")
+            return
+        
+        # Organize data by subject
+        subject_data = {}
+        for subject, _, grade, date in grades:
+            if subject not in subject_data:
+                subject_data[subject] = {'dates': [], 'grades': []}
+            subject_data[subject]['dates'].append(date)
+            subject_data[subject]['grades'].append(grade)
+        
+        # Analyze each subject
+        weak_topics = []
+        recommendations = []
+        subject_stats = []
+        
+        for subject, data in subject_data.items():
+            if len(data['grades']) < 2:  # Not enough data points
+                continue
+                
+            # Convert dates to numerical values (days since first test)
+            date_objs = [datetime.strptime(d, "%Y-%m-%d") for d in data['dates']]
+            days = [(d - date_objs[0]).days for d in date_objs]
+            
+            # Prepare data for linear regression
+            X = np.array(days).reshape(-1, 1)
+            y = np.array(data['grades'])
+            
+            # Train simple linear regression model
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            # Calculate performance metrics
+            trend_slope = model.coef_[0]
+            trend = "improving" if trend_slope > 0.1 else "declining" if trend_slope < -0.1 else "stable"
+            avg_grade = np.mean(y)
+            last_grade = y[-1]
+            volatility = np.std(y)
+            
+            # Store subject stats
+            subject_stats.append({
+                'subject': subject,
+                'avg_grade': avg_grade,
+                'trend': trend,
+                'volatility': volatility,
+                'last_grade': last_grade
+            })
+            
+            # Identify weak topics
+            if avg_grade < 70 or (trend == "declining" and last_grade < 75):
+                weak_topics.append(subject)
+                
+                # Generate recommendations
+                if avg_grade < 60:
+                    rec = f"🚨 CRITICAL: {subject} (Avg: {avg_grade:.1f}%, Trend: {trend})"
+                    priority = 1
+                elif avg_grade < 70:
+                    rec = f"⚠️ WARNING: {subject} (Avg: {avg_grade:.1f}%, Trend: {trend})"
+                    priority = 2
+                else:
+                    rec = f"⚠️ CAUTION: {subject} (Avg: {avg_grade:.1f}%, Trend: {trend})"
+                    priority = 3
+                
+                recommendations.append((priority, rec))
+        
+        # Sort recommendations by priority
+        recommendations.sort()
+        
+        # Display results
+        self.recommendation_text.config(state=tk.NORMAL)
+        self.recommendation_text.delete(1.0, tk.END)
+        
+        if not weak_topics:
+            self.recommendation_text.insert(tk.END, "🎉 EXCELLENT PERFORMANCE!\n\n")
+            self.recommendation_text.insert(tk.END, "No weak topics detected. Keep up the good work!")
+        else:
+            self.recommendation_text.insert(tk.END, "📊 WEAK TOPIC ANALYSIS\n\n")
+            self.recommendation_text.insert(tk.END, "Subjects needing attention:\n\n")
+            
+            for _, rec in recommendations:
+                self.recommendation_text.insert(tk.END, f"• {rec}\n")
+            
+            # Generate study plan
+            self.generate_study_plan(subject_stats, weak_topics)
+        
+        self.recommendation_text.config(state=tk.DISABLED)
+
+    def generate_study_plan(self, subject_stats, weak_topics):
+        # Sort subjects by average grade (lowest first)
+        subject_stats.sort(key=lambda x: x['avg_grade'])
+        
+        self.study_plan_text.config(state=tk.NORMAL)
+        self.study_plan_text.delete(1.0, tk.END)
+        
+        self.study_plan_text.insert(tk.END, "📝 PERSONALIZED STUDY PLAN\n\n")
+        self.study_plan_text.insert(tk.END, "Recommended focus areas:\n\n")
+        
+        for i, subject in enumerate(weak_topics, 1):
+            stats = next(s for s in subject_stats if s['subject'] == subject)
+            
+            self.study_plan_text.insert(tk.END, f"{i}. {subject}:\n")
+            self.study_plan_text.insert(tk.END, f"   • Current Average: {stats['avg_grade']:.1f}%\n")
+            self.study_plan_text.insert(tk.END, f"   • Trend: {stats['trend'].capitalize()}\n")
+            
+            if stats['avg_grade'] < 60:
+                self.study_plan_text.insert(tk.END, "   • Action: Intensive review needed\n")
+                self.study_plan_text.insert(tk.END, "   • Suggested: 3-4 focused study sessions per week\n")
+            elif stats['avg_grade'] < 70:
+                self.study_plan_text.insert(tk.END, "   • Action: Regular practice needed\n")
+                self.study_plan_text.insert(tk.END, "   • Suggested: 2-3 study sessions per week\n")
+            else:
+                self.study_plan_text.insert(tk.END, "   • Action: Maintenance practice\n")
+                self.study_plan_text.insert(tk.END, "   • Suggested: 1-2 study sessions per week\n")
+            
+            self.study_plan_text.insert(tk.END, "\n")
+        
+        self.study_plan_text.insert(tk.END, "\n💡 STUDY TIPS:\n")
+        self.study_plan_text.insert(tk.END, "- Use flashcards for key concepts\n")
+        self.study_plan_text.insert(tk.END, "- Review past tests and mistakes\n")
+        self.study_plan_text.insert(tk.END, "- Practice with timed exercises\n")
+        self.study_plan_text.insert(tk.END, "- Seek help for difficult topics early\n")
+        
+        self.study_plan_text.config(state=tk.DISABLED)
+
+# --- Smart Flashcards System ---
+class Flashcards:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.window = tk.Toplevel()
+        self.window.title("Smart Flashcards")
+        self.window.geometry("800x600")
+
+        # Create tabs
+        self.tab_control = ttk.Notebook(self.window)
+        self.study_tab = ttk.Frame(self.tab_control)
+        self.create_tab = ttk.Frame(self.tab_control)
+        self.import_tab = ttk.Frame(self.tab_control)
+        self.stats_tab = ttk.Frame(self.tab_control)
+        
+        self.tab_control.add(self.study_tab, text="Study")
+        self.tab_control.add(self.create_tab, text="Create")
+        self.tab_control.add(self.import_tab, text="Import")
+        self.tab_control.add(self.stats_tab, text="Stats")
+        self.tab_control.pack(expand=1, fill="both")
+        
+        # Initialize with default flashcards
+        self.default_flashcards = [
+            ("What is the capital of France?", "Paris", "Geography"),
+            ("What is 2 + 2?", "4", "Math"),
+            ("What is the largest ocean?", "Pacific Ocean", "Geography")
+        ]
+        
+        # Setup tabs
+        self.setup_study_tab()
+        self.setup_create_tab()
+        self.setup_import_tab()
+        self.setup_stats_tab()
+        
+        # Load user's flashcards
+        self.user_flashcards = self.load_user_flashcards()
+        self.current_flashcard = None
+        self.show_random_flashcard()
+
+    def setup_study_tab(self):
+        # Question label
+        self.question_label = tk.Label(
+            self.study_tab, 
+            text="", 
+            font=("Helvetica", 14), 
+            wraplength=500,
+            height=8,
+            relief=tk.SUNKEN,
+            padx=10,
+            pady=10
+        )
+        self.question_label.pack(pady=20, fill=tk.X, padx=20)
+        
+        # Answer entry
+        self.answer_entry = tk.Entry(
+            self.study_tab, 
+            width=50,
+            font=("Helvetica", 12)
+        )
+        self.answer_entry.pack(pady=10)
+        
+        # Button frame
+        btn_frame = tk.Frame(self.study_tab)
+        btn_frame.pack(pady=10)
+        
+        check_btn = tk.Button(
+            btn_frame, 
+            text="Check Answer", 
+            command=self.check_answer,
+            bg="#4CAF50",
+            fg="white"
+        )
+        check_btn.pack(side=tk.LEFT, padx=5)
+        
+        next_btn = tk.Button(
+            btn_frame, 
+            text="Next Card", 
+            command=self.show_random_flashcard,
+            bg="#2196F3",
+            fg="white"
+        )
+        next_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Difficulty buttons
+        diff_frame = tk.Frame(self.study_tab)
+        diff_frame.pack(pady=10)
+        
+        tk.Label(diff_frame, text="Rate difficulty:").pack(side=tk.LEFT)
+        
+        easy_btn = tk.Button(
+            diff_frame, 
+            text="Easy", 
+            command=lambda: self.rate_difficulty(1),
+            bg="#8BC34A",
+            fg="white"
+        )
+        easy_btn.pack(side=tk.LEFT, padx=2)
+        
+        medium_btn = tk.Button(
+            diff_frame, 
+            text="Medium", 
+            command=lambda: self.rate_difficulty(2),
+            bg="#FFC107",
+            fg="white"
+        )
+        medium_btn.pack(side=tk.LEFT, padx=2)
+        
+        hard_btn = tk.Button(
+            diff_frame, 
+            text="Hard", 
+            command=lambda: self.rate_difficulty(3),
+            bg="#F44336",
+            fg="white"
+        )
+        hard_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Subject filter
+        filter_frame = tk.Frame(self.study_tab)
+        filter_frame.pack(pady=10)
+        
+        tk.Label(filter_frame, text="Filter by subject:").pack(side=tk.LEFT)
+        self.subject_filter = ttk.Combobox(filter_frame, state="readonly")
+        self.subject_filter.pack(side=tk.LEFT, padx=5)
+        self.subject_filter.bind("<<ComboboxSelected>>", lambda e: self.show_random_flashcard())
+        self.update_subject_filter()
+
+    def setup_create_tab(self):
+        # Question entry
+        tk.Label(self.create_tab, text="Question:", font=("Helvetica", 11)).pack(pady=(10,0))
+        self.new_question = tk.Text(
+            self.create_tab, 
+            height=4, 
+            width=60,
+            font=("Helvetica", 11),
+            wrap=tk.WORD
+        )
+        self.new_question.pack(pady=5, padx=10)
+        
+        # Answer entry
+        tk.Label(self.create_tab, text="Answer:", font=("Helvetica", 11)).pack()
+        self.new_answer = tk.Text(
+            self.create_tab, 
+            height=4, 
+            width=60,
+            font=("Helvetica", 11),
+            wrap=tk.WORD
+        )
+        self.new_answer.pack(pady=5, padx=10)
+        
+        # Subject entry
+        tk.Label(self.create_tab, text="Subject:", font=("Helvetica", 11)).pack()
+        self.new_subject = ttk.Combobox(
+            self.create_tab, 
+            values=["Math", "Science", "History", "Language", "Geography", "Other"],
+            width=25
+        )
+        self.new_subject.pack(pady=5)
+        
+        # Save button
+        save_btn = tk.Button(
+            self.create_tab, 
+            text="Save Flashcard", 
+            command=self.save_flashcard,
+            bg="#4CAF50",
+            fg="white",
+            font=("Helvetica", 11)
+        )
+        save_btn.pack(pady=10)
+
+    def setup_import_tab(self):
+        # API import options
+        tk.Label(self.import_tab, text="Import Flashcards", font=("Helvetica", 12, "bold")).pack(pady=10)
+        
+        # Quizlet import
+        quizlet_frame = tk.Frame(self.import_tab)
+        quizlet_frame.pack(pady=5, fill=tk.X)
+        tk.Label(quizlet_frame, text="From Quizlet:", font=("Helvetica", 11)).pack(side=tk.LEFT)
+        self.quizlet_entry = tk.Entry(quizlet_frame, width=30)
+        self.quizlet_entry.pack(side=tk.LEFT, padx=5)
+        self.quizlet_entry.insert(0, "Enter set URL or ID")
+        quizlet_btn = tk.Button(
+            quizlet_frame, 
+            text="Import", 
+            command=self.import_from_quizlet,
+            bg="#4285F4",
+            fg="white"
+        )
+        quizlet_btn.pack(side=tk.LEFT)
+        
+        # CSV import
+        csv_frame = tk.Frame(self.import_tab)
+        csv_frame.pack(pady=5, fill=tk.X)
+        tk.Label(csv_frame, text="From CSV File:", font=("Helvetica", 11)).pack(side=tk.LEFT)
+        csv_btn = tk.Button(
+            csv_frame, 
+            text="Browse", 
+            command=self.import_csv,
+            bg="#FF5722",
+            fg="white"
+        )
+        csv_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Sample data button
+        sample_btn = tk.Button(
+            self.import_tab,
+            text="Load Sample Flashcards",
+            command=self.load_sample_flashcards,
+            bg="#9C27B0",
+            fg="white"
+        )
+        sample_btn.pack(pady=20)
+
+    def setup_stats_tab(self):
+        # Stats display
+        self.stats_text = tk.Text(
+            self.stats_tab,
+            height=15,
+            width=70,
+            wrap=tk.WORD,
+            font=("Helvetica", 10)
+        )
+        self.stats_text.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+        self.stats_text.insert(tk.END, "Flashcard statistics will appear here...")
+        self.stats_text.config(state=tk.DISABLED)
+        
+        # Refresh button
+        refresh_btn = tk.Button(
+            self.stats_tab,
+            text="Refresh Stats",
+            command=self.update_stats,
+            bg="#607D8B",
+            fg="white"
+        )
+        refresh_btn.pack(pady=5)
+        
+        # Initial stats load
+        self.update_stats()
+
+    def show_random_flashcard(self):
+        subject = self.subject_filter.get()
+        all_cards = self.user_flashcards + self.default_flashcards
+        
+        if subject:
+            filtered_cards = [card for card in all_cards if card[2] == subject]
+            if filtered_cards:
+                self.current_flashcard = random.choice(filtered_cards)
+            else:
+                messagebox.showinfo("No Cards", f"No cards found for subject: {subject}")
+                return
+        else:
+            self.current_flashcard = random.choice(all_cards)
+            
+        self.question_label.config(text=self.current_flashcard[0])
+        self.answer_entry.delete(0, tk.END)
+
+    def check_answer(self):
+        if not self.current_flashcard:
+            return
+            
+        user_answer = self.answer_entry.get().strip()
+        correct_answer = self.current_flashcard[1]
+        
+        if user_answer.lower() == correct_answer.lower():
+            messagebox.showinfo("Correct!", "That's the right answer!")
+        else:
+            messagebox.showerror("Incorrect", 
+                                f"Sorry, the correct answer is:\n\n{correct_answer}")
+        
+        self.show_random_flashcard()
+
+    def rate_difficulty(self, difficulty):
+        if not self.current_flashcard or len(self.current_flashcard) < 4:
+            return
+            
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE flashcards SET difficulty = ?, last_reviewed = ? WHERE question = ? AND user_id = ?",
+                (difficulty, datetime.now().strftime("%Y-%m-%d"), self.current_flashcard[0], self.user_id)
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"Error updating difficulty: {e}")
+        finally:
+            if conn:
+                conn.close()
+        
+        self.show_random_flashcard()
+
+    def save_flashcard(self):
+        question = self.new_question.get("1.0", tk.END).strip()
+        answer = self.new_answer.get("1.0", tk.END).strip()
+        subject = self.new_subject.get()
+        
+        if not question or not answer:
+            messagebox.showerror("Error", "Question and answer are required!")
+            return
+            
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO flashcards (user_id, question, answer, subject) VALUES (?, ?, ?, ?)",
+                (self.user_id, question, answer, subject)
+            )
+            conn.commit()
+            messagebox.showinfo("Success", "Flashcard saved!")
+            self.user_flashcards = self.load_user_flashcards()
+            self.update_subject_filter()
+            self.new_question.delete("1.0", tk.END)
+            self.new_answer.delete("1.0", tk.END)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def load_user_flashcards(self):
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT question, answer, subject, difficulty FROM flashcards WHERE user_id = ?",
+                (self.user_id,)
+            )
+            return cursor.fetchall()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load flashcards: {str(e)}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def update_subject_filter(self):
+        subjects = set()
+        for card in self.user_flashcards + self.default_flashcards:
+            if card[2]:
+                subjects.add(card[2])
+        self.subject_filter['values'] = list(subjects)
+
+    def import_from_quizlet(self):
+        quizlet_url = self.quizlet_entry.get()
+        if not quizlet_url:
+            messagebox.showerror("Error", "Please enter a Quizlet URL or set ID")
+            return
+            
+        try:
+            # In a real implementation, use Quizlet API
+            # This is a mock implementation
+            messagebox.showinfo("Info", "In a full implementation, this would connect to Quizlet API")
+            
+            # Mock data
+            imported_cards = [
+                ("What is the powerhouse of the cell?", "Mitochondria", "Biology"),
+                ("What is Newton's first law?", "Law of Inertia", "Physics"),
+                ("What is the chemical formula for water?", "H₂O", "Chemistry")
+            ]
+            
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.executemany(
+                "INSERT INTO flashcards (user_id, question, answer, subject) VALUES (?, ?, ?, ?)",
+                [(self.user_id, q, a, s) for q, a, s in imported_cards]
+            )
+            conn.commit()
+            messagebox.showinfo("Success", f"Imported {len(imported_cards)} flashcards!")
+            self.user_flashcards = self.load_user_flashcards()
+            self.update_subject_filter()
+        except Exception as e:
+            messagebox.showerror("Error", f"Import failed: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def import_csv(self):
+        file_path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, newline='', encoding='utf-8') as csvfile:
+                reader = csv.reader(csvfile)
+                imported_cards = []
+                for row in reader:
+                    if len(row) >= 2:
+                        question = row[0]
+                        answer = row[1]
+                        subject = row[2] if len(row) > 2 else ""
+                        imported_cards.append((question, answer, subject))
+                
+                if not imported_cards:
+                    messagebox.showerror("Error", "No valid flashcards found in CSV")
+                    return
+                
+                conn = sqlite3.connect("todo.db")
+                cursor = conn.cursor()
+                cursor.executemany(
+                    "INSERT INTO flashcards (user_id, question, answer, subject) VALUES (?, ?, ?, ?)",
+                    [(self.user_id, q, a, s) for q, a, s in imported_cards]
+                )
+                conn.commit()
+                messagebox.showinfo("Success", f"Imported {len(imported_cards)} flashcards from CSV!")
+                self.user_flashcards = self.load_user_flashcards()
+                self.update_subject_filter()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to import CSV: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def load_sample_flashcards(self):
+        sample_cards = [
+            ("What is the derivative of x²?", "2x", "Math"),
+            ("Who wrote 'Romeo and Juliet'?", "William Shakespeare", "Literature"),
+            ("What is the atomic number of oxygen?", "8", "Chemistry"),
+            ("In what year did WWII end?", "1945", "History"),
+            ("What is the capital of Japan?", "Tokyo", "Geography")
+        ]
+        
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.executemany(
+                "INSERT INTO flashcards (user_id, question, answer, subject) VALUES (?, ?, ?, ?)",
+                [(self.user_id, q, a, s) for q, a, s in sample_cards]
+            )
+            conn.commit()
+            messagebox.showinfo("Success", f"Loaded {len(sample_cards)} sample flashcards!")
+            self.user_flashcards = self.load_user_flashcards()
+            self.update_subject_filter()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load samples: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def update_stats(self):
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            
+            # Get total count
+            cursor.execute("SELECT COUNT(*) FROM flashcards WHERE user_id = ?", (self.user_id,))
+            total = cursor.fetchone()[0]
+            
+            # Get by subject
+            cursor.execute(
+                "SELECT subject, COUNT(*) FROM flashcards WHERE user_id = ? GROUP BY subject",
+                (self.user_id,)
+            )
+            by_subject = cursor.fetchall()
+            
+            # Get difficulty distribution
+            cursor.execute(
+                "SELECT difficulty, COUNT(*) FROM flashcards WHERE user_id = ? GROUP BY difficulty",
+                (self.user_id,)
+            )
+            by_difficulty = cursor.fetchall()
+            
+            # Get recently reviewed
+            cursor.execute(
+                "SELECT question, last_reviewed FROM flashcards WHERE user_id = ? AND last_reviewed IS NOT NULL ORDER BY last_reviewed DESC LIMIT 5",
+                (self.user_id,)
+            )
+            recent = cursor.fetchall()
+            
+            # Format stats
+            self.stats_text.config(state=tk.NORMAL)
+            self.stats_text.delete(1.0, tk.END)
+            
+            self.stats_text.insert(tk.END, "📊 FLASHCARD STATISTICS\n\n")
+            self.stats_text.insert(tk.END, f"Total flashcards: {total}\n\n")
+            
+            self.stats_text.insert(tk.END, "By Subject:\n")
+            for subject, count in by_subject:
+                self.stats_text.insert(tk.END, f"- {subject}: {count}\n")
+            
+            self.stats_text.insert(tk.END, "\nBy Difficulty:\n")
+            for diff, count in by_difficulty:
+                level = "Easy" if diff == 1 else "Medium" if diff == 2 else "Hard"
+                self.stats_text.insert(tk.END, f"- {level}: {count}\n")
+            
+            self.stats_text.insert(tk.END, "\nRecently Reviewed:\n")
+            for question, date in recent:
+                self.stats_text.insert(tk.END, f"- {question[:30]}... ({date})\n")
+            
+            self.stats_text.config(state=tk.DISABLED)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load stats: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+# --- Debug Logging Helper ---
+def _log_debug_info(location, message, data=None, agent="A"):
+    # Simple debug logger, prints to stdout
+    print(f"[DEBUG][{agent}] {location}: {message} | Data: {data}")
+
+# --- Login & Registration System ---
+class LoginRegister:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Study Companion - Login/Register")
+        self.master.geometry("450x400")
+        self.master.configure(bg="#f5f5f5")
+
+        # Style configuration
+        style = ttk.Style()
+        style.configure("TFrame", background="#f5f5f5")
+        style.configure("TLabel", background="#f5f5f5", font=("Helvetica", 10))
+        style.configure("TButton", font=("Helvetica", 10), padding=5)
+        style.configure("TNotebook", background="#f5f5f5")
+        style.configure("TNotebook.Tab", font=("Helvetica", 10, "bold"), padding=5)
+        style.map("Accent.TButton", background=[("active", "#45a049")])
+        style.configure("Accent.TButton", foreground="white", background="#4CAF50")
+
+        # Create tabs
+        self.tab_control = ttk.Notebook(self.master)
+        self.login_frame = ttk.Frame(self.tab_control)
+        self.register_frame = ttk.Frame(self.tab_control)
+        
+        self.tab_control.add(self.login_frame, text="Login")
+        self.tab_control.add(self.register_frame, text="Register")
+        self.tab_control.pack(expand=1, fill="both", padx=10, pady=10)
+
+        # Login Tab
+        self.setup_login_tab()
+        
+        # Register Tab
+        self.setup_register_tab()
+
+    def setup_login_tab(self):
+        login_container = ttk.Frame(self.login_frame)
+        login_container.pack(pady=40, padx=20, fill=tk.BOTH, expand=True)
+        
+        ttk.Label(login_container, text="Username:", font=("Helvetica", 11)).pack(pady=(0,5))
+        self.username_entry = ttk.Entry(login_container, width=30, font=("Helvetica", 11))
+        self.username_entry.pack(pady=5)
+        
+        ttk.Label(login_container, text="Password:", font=("Helvetica", 11)).pack(pady=(10,5))
+        self.password_entry = ttk.Entry(login_container, width=30, show="*", font=("Helvetica", 11))
+        self.password_entry.pack(pady=5)
+        
+        login_btn = ttk.Button(
+            login_container, 
+            text="Login", 
+            command=self.login,
+            style="Accent.TButton"
+        )
+        login_btn.pack(pady=20)
+
+    def setup_register_tab(self):
+        register_container = ttk.Frame(self.register_frame)
+        register_container.pack(pady=30, padx=20, fill=tk.BOTH, expand=True)
+        
+        ttk.Label(register_container, text="Username:", font=("Helvetica", 11)).pack(pady=(0,5))
+        self.register_username_entry = ttk.Entry(register_container, width=30, font=("Helvetica", 11))
+        self.register_username_entry.pack(pady=5)
+        
+        ttk.Label(register_container, text="Password:", font=("Helvetica", 11)).pack(pady=(10,5))
+        self.register_password_entry = ttk.Entry(register_container, width=30, show="*", font=("Helvetica", 11))
+        self.register_password_entry.pack(pady=5)
+        
+        ttk.Label(register_container, text="Study Goals:", font=("Helvetica", 11)).pack(pady=(10,5))
+        self.goals_entry = ttk.Entry(register_container, width=30, font=("Helvetica", 11))
+        self.goals_entry.pack(pady=5)
+        
+        register_btn = ttk.Button(
+            register_container, 
+            text="Register", 
+            command=self.register,
+            style="Accent.TButton"
+        )
+        register_btn.pack(pady=20)
+
+    def login(self):
+        username = self.username_entry.get()
+        password = self.password_entry.get()
+
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE username = ? AND password = ?", (username, password))
+            user = cursor.fetchone()
+            
+            if user:
+                user_id = user[0]
+                messagebox.showinfo("Login Successful", "Welcome back to your Study Companion!")
+                self.master.destroy()
+                main_app = MainApp(user_id)
+            else:
+                messagebox.showerror("Login Failed", "Incorrect username or password")
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Login failed: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def register(self):
+        username = self.register_username_entry.get()
+        password = self.register_password_entry.get()
+        goals = self.goals_entry.get()
+
+        if not username or not password:
+            messagebox.showwarning("Input Error", "Username and password are required!")
+            return
+
+        try:
+            conn = sqlite3.connect("todo.db")
+            cursor = conn.cursor()
+            
+            # Check if username exists
+            cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+            if cursor.fetchone():
+                messagebox.showerror("Registration Failed", "Username already exists")
+                return
+            
+            # #region agent log
+            _log_debug_info("main.py:1284", "Before inserting new user", {"username": username, "goals": goals}, "A")
+            # #endregion
+            
+            # Insert new user
+            cursor.execute(
+                "INSERT INTO users (username, password, study_goals) VALUES (?, ?, ?)",
+                (username, password, goals)
+            )
+            # #region agent log
+            _log_debug_info("main.py:1293", "After inserting new user", {"username": username}, "A")
+            # #endregion
+            conn.commit()
+            
+            messagebox.showinfo("Registration Successful", "Account created successfully!")
+            self.register_username_entry.delete(0, tk.END)
+            self.register_password_entry.delete(0, tk.END)
+            self.goals_entry.delete(0, tk.END)
+            self.tab_control.select(self.login_frame)
+        except sqlite3.Error as e:
+            messagebox.showerror("Registration Failed", f"Database error: {str(e)}")
+        except Exception as e:
+            messagebox.showerror("Registration Failed", f"An error occurred: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+# --- Main Application ---
+class MainApp:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.window = tk.Tk()
+        self.window.title("Study Companion")
+        self.window.geometry("700x550")
+        self.window.configure(bg="#f5f5f5")
+
+        # Header
+        header_frame = tk.Frame(self.window, bg="#4CAF50")
+        header_frame.pack(fill=tk.X)
+        
+        tk.Label(
+            header_frame, 
+            text="Study Companion", 
+            font=("Helvetica", 20, "bold"), 
+            fg="white", 
+            bg="#4CAF50"
+        ).pack(pady=15)
+
+        # Main buttons
+        btn_frame = tk.Frame(self.window, bg="#f5f5f5")
+        btn_frame.pack(pady=30)
+
+        # Timer Button
+        timer_btn = tk.Button(
+            btn_frame, 
+            text="Pomodoro Timer", 
+            command=self.open_timer,
+            font=("Helvetica", 12),
+            bg="#2196F3",
+            fg="white",
+            width=15,
+            height=2
+        )
+        timer_btn.grid(row=0, column=0, padx=10, pady=10)
+
+        # To-Do Button
+        todo_btn = tk.Button(
+            btn_frame, 
+            text="To-Do List", 
+            command=self.open_todo_list,
+            font=("Helvetica", 12),
+            bg="#FF9800",
+            fg="white",
+            width=15,
+            height=2
+        )
+        todo_btn.grid(row=0, column=1, padx=10, pady=10)
+
+        # Flashcards Button
+        flashcards_btn = tk.Button(
+            btn_frame, 
+            text="Flashcards", 
+            command=self.open_flashcards,
+            font=("Helvetica", 12),
+            bg="#9C27B0",
+            fg="white",
+            width=15,
+            height=2
+        )
+        flashcards_btn.grid(row=1, column=0, padx=10, pady=10)
+
+        # Grades Button
+        grades_btn = tk.Button(
+            btn_frame, 
+            text="Grade Tracker", 
+            command=self.open_grade_tracker,
+            font=("Helvetica", 12),
+            bg="#F44336",
+            fg="white",
+            width=15,
+            height=2
+        )
+        grades_btn.grid(row=1, column=1, padx=10, pady=10)
+
+        # Footer
+        footer_frame = tk.Frame(self.window, bg="#f5f5f5")
+        footer_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        
+        tk.Label(
+            footer_frame, 
+            text="© 2023 Study Companion | DeepSeek", 
+            font=("Helvetica", 8), 
+            fg="gray",
+            bg="#f5f5f5"
+        ).pack()
+
+    def open_timer(self):
+        Timer(self.window, self.user_id)
+
+    def open_todo_list(self):
+        ToDoList(self.user_id)
+
+    def open_flashcards(self):
+        Flashcards(self.user_id)
+
+    def open_grade_tracker(self):
+        GradeTracker(self.user_id)
+
+# --- Database Creation Helper ---
+def create_db():
+    conn = sqlite3.connect("todo.db")
+    cursor = conn.cursor()
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            study_goals TEXT
+        )
+    """)
+    # Tasks table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_name TEXT NOT NULL,
+            due_date TEXT,
+            user_id INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    # Study sessions table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS study_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            subject TEXT,
+            duration INTEGER,
+            date TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    # Grades table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS grades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            subject TEXT,
+            test_name TEXT,
+            grade REAL,
+            date TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    # Flashcards table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flashcards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            question TEXT,
+            answer TEXT,
+            subject TEXT,
+            difficulty INTEGER,
+            last_reviewed TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# --- Run Application ---
+if __name__ == "__main__":
+    create_db()
+    root = tk.Tk()
+    login_register = LoginRegister(root)
+    root.mainloop()
